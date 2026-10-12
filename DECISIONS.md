@@ -15,4 +15,5 @@ Employees are ranked by total late minutes. Employees with the same total receiv
 Department headcount is calculated from employee records rather than attendance logs. This ensures employees who have not yet recorded attendance are still included.
 
 ### 5. Scaling to 100 Times More Data
-For larger datasets, I would review query execution plans, create suitable indexes, and ensure filtering and aggregation happen in MongoDB. I would also consider pagination, monitoring, and suitable database capacity to maintain performance.
+
+For larger datasets, I would use MongoDB aggregation pipelines to perform filtering and calculations in the database rather than loading records into Python. I would review query execution plans using `explain("executionStats")`, add indexes based on actual query patterns, and verify that frequently used queries use indexes where appropriate. I would also test performance with a larger dataset, monitor query execution times, and review pagination and database capacity.

@@ -9,6 +9,7 @@ works, but nobody has reviewed it. Read PROBLEM_STATEMENT.docx for what is expec
 openapi.yaml for the contract and DATA_MODEL.md for what is stored in MongoDB.
 """
 import os
+import json
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
@@ -17,6 +18,8 @@ from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 from pymongo import MongoClient
 from decimal import Decimal, ROUND_HALF_UP
+from fastapi import HTTPException
+from bson import json_util
 
 load_dotenv()
 
@@ -41,31 +44,31 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 # Helpers
 # --------------------------------------------------------------------------- #
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    h, m = map(int, shift_start.split(":"))
-
     # Convert punch-in time to IST
     if punch_in.tzinfo is not None:
         punch_in = punch_in.astimezone(IST)
     else:
         punch_in = punch_in.replace(tzinfo=IST)
 
-    # Build shift start time in IST
-    start = punch_in.replace(
-        hour=h,
-        minute=m,
+    # Parse the shift start time
+    hour, minute = map(int, shift_start.split(":"))
+
+    shift_start_dt = punch_in.replace(
+        hour=hour,
+        minute=minute,
         second=0,
-        microsecond=0
+        microsecond=0,
     )
 
-    elapsed_seconds = (punch_in - start).total_seconds()
+    # Calculate elapsed seconds from shift start
+    elapsed_seconds = (punch_in - shift_start_dt).total_seconds()
 
-    # Apply the 10-minute grace period
+    # Early arrivals and arrivals within 10 minutes are not late
     if elapsed_seconds <= 600:
         return 0
 
-    # Return whole minutes late
+    # Return whole elapsed minutes after shift start
     return int(elapsed_seconds // 60)
-
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     seconds = (punch_out - punch_in).total_seconds()
@@ -73,35 +76,60 @@ def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
     return float(hours.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP))
 
 
-def compute_overtime(punch_out: datetime, shift_end: str, date_str: str) -> int:
-    h, m = map(int, shift_end.split(":"))
-    shift_date = datetime.fromisoformat(date_str).date()
-
-    # Convert punch-out to IST
+def compute_overtime(
+    punch_out: datetime,
+    shift_start: str,
+    shift_end: str,
+    date_str: str,
+) -> int:
+    # Convert punch-out timestamp to IST
     if punch_out.tzinfo is not None:
         punch_out = punch_out.astimezone(IST)
     else:
-        punch_out = punch_out.replace(tzinfo=IST)
+        # Assume naive timestamps are stored in UTC
+        punch_out = punch_out.replace(tzinfo=timezone.utc).astimezone(IST)
 
-    # Create shift-end time in IST
-    end = datetime(
+    # Parse attendance date
+    shift_date = datetime.fromisoformat(date_str).date()
+
+    # Parse shift timings
+    start_hour, start_minute = map(int, shift_start.split(":"))
+    end_hour, end_minute = map(int, shift_end.split(":"))
+
+    # Create shift start datetime in IST
+    shift_start_dt = datetime(
         shift_date.year,
         shift_date.month,
         shift_date.day,
-        h,
-        m,
-        tzinfo=IST
+        start_hour,
+        start_minute,
+        tzinfo=IST,
     )
 
-    # Overnight shift: end time is on the following day
-    if h < 12:
-        end += timedelta(days=1)
+    # Create shift end datetime in IST
+    shift_end_dt = datetime(
+        shift_date.year,
+        shift_date.month,
+        shift_date.day,
+        end_hour,
+        end_minute,
+        tzinfo=IST,
+    )
+
+    # Handle overnight shifts
+    if shift_end_dt <= shift_start_dt:
+        shift_end_dt += timedelta(days=1)
 
     # Calculate overtime in whole minutes
-    overtime_minutes = int((punch_out - end).total_seconds() // 60)
+    overtime_minutes = int(
+        (punch_out - shift_end_dt).total_seconds() // 60
+    )
 
-    # Count overtime only when it reaches 30 minutes
-    return overtime_minutes if overtime_minutes >= 30 else 0
+    # Count overtime only when it is at least 30 minutes
+    if overtime_minutes >= 30:
+        return overtime_minutes
+
+    return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -121,6 +149,10 @@ class PunchInIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = None
     status: str = "PRESENT"
+    
+class PunchOutIn(BaseModel):
+    emp_code: str
+    punched_at: Optional[int] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -225,30 +257,10 @@ def list_attendance(
         d["id"] = str(d.pop("_id"))
     return {"items": page_docs, "total": total, "page": page, "page_size": page_size}
 
-#   POST  /attendance/punch-out
+# POST /attendance/punch-out
 @app.post("/attendance/punch-out")
-def punch_out(body: PunchInIn):
+def punch_out(body: PunchOutIn):
     emp_code = body.emp_code
-
-    # Find today's attendance record
-    today = datetime.now(IST).date().isoformat()
-
-    record = db.attendance_logs.find_one({
-        "emp_code": emp_code,
-        "date": today
-    })
-
-    if not record:
-        raise HTTPException(
-            status_code=404,
-            detail="Punch-in record not found"
-        )
-
-    if record.get("punch_out") is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="Already punched out"
-        )
 
     # Get punch-out timestamp
     ts = (
@@ -260,25 +272,97 @@ def punch_out(body: PunchInIn):
         else datetime.now(timezone.utc)
     ).replace(microsecond=0)
 
-    # Convert to IST for attendance calculations
+    # Find employee shift details
+    employee = db.employees.find_one(
+        {"emp_code": emp_code},
+        {"shift_start": 1, "shift_end": 1}
+    )
+
+    if not employee:
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found"
+        )
+
+    # Find the most recent open attendance record
+    record = db.attendance_logs.find_one(
+        {
+            "emp_code": emp_code,
+            "punch_in": {
+                "$exists": True,
+                "$ne": None
+            },
+            "punch_out": None
+        },
+        sort=[("punch_in", -1)]
+    )
+
+    # Handle missing open attendance record
+    if not record:
+        existing = db.attendance_logs.find_one(
+            {
+                "emp_code": emp_code,
+                "punch_in": {
+                    "$exists": True,
+                    "$ne": None
+                },
+                "punch_out": {
+                    "$exists": True,
+                    "$ne": None
+                }
+            },
+            sort=[("punch_in", -1)]
+        )
+
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail="Attendance record was already punched out"
+            )
+
+        raise HTTPException(
+            status_code=404,
+            detail="Punch-in record not found"
+        )
+
+    # Get punch-in timestamp
     punch_in = record["punch_in"]
+
     if punch_in.tzinfo is None:
         punch_in = punch_in.replace(tzinfo=timezone.utc)
 
-    shift_end = db.employees.find_one(
-        {"emp_code": emp_code},
-        {"shift_end": 1}
-    )["shift_end"]
+    # Validate punch-out timestamp
+    if ts <= punch_in:
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out time must be after punch-in time"
+        )
 
+    if ts > punch_in + timedelta(hours=24):
+        raise HTTPException(
+            status_code=422,
+            detail="Punch-out time cannot be more than 24 hours after punch-in"
+        )
+
+    # Calculate work hours
     work_hours = compute_work_hours(punch_in, ts)
-    overtime_minutes = compute_overtime(
-        ts,
-        shift_end,
-        record["date"]
+
+    # Calculate overtime
+    overtime_minutes = int(
+        compute_overtime(
+            ts,
+            employee["shift_start"],
+            employee["shift_end"],
+            record["date"]
+        )
     )
 
+    # Update attendance record atomically
     result = db.attendance_logs.update_one(
-        {"_id": record["_id"], "punch_out": None},
+        {
+            "_id": record["_id"],
+            "punch_out": None
+        },
         {
             "$set": {
                 "punch_out": ts,
@@ -289,19 +373,21 @@ def punch_out(body: PunchInIn):
         }
     )
 
+    # Handle simultaneous punch-out requests
     if result.modified_count == 0:
         raise HTTPException(
             status_code=409,
             detail="Attendance record was already updated"
         )
 
+    # Return updated attendance record
     updated = db.attendance_logs.find_one(
         {"_id": record["_id"]}
     )
+
     updated["id"] = str(updated.pop("_id"))
 
     return updated
-
 #   PATCH /attendance/{emp_code}/{date}
 @app.patch("/attendance/{emp_code}/{date}")
 def update_attendance(
@@ -329,9 +415,24 @@ def update_attendance(
     })
 
     if not record:
+        existing = db.attendance_logs.find_one(
+            {
+                "emp_code": emp_code,
+                "punch_in": {"$exists": True, "$ne": None},
+                "punch_out": {"$ne": None}
+            },
+            sort=[("punch_in", -1)]
+        )
+
+        if existing:
+            raise HTTPException(
+                status_code=409,
+                detail="Attendance record was already punched out"
+            )
+
         raise HTTPException(
             status_code=404,
-            detail="Attendance record not found"
+            detail="Punch-in record not found"
         )
 
     # Prepare the fields to update
@@ -1140,5 +1241,119 @@ def department_trend(
         "items": rows,
     }
 
-#   GET   /admin/explain/{endpoint}
-# --------------------------------------------------------------------------- #
+@app.get("/admin/explain/{endpoint}")
+def explain_endpoint(endpoint: str):
+    if endpoint == "attendance_list":
+        command = {
+            "find": "attendance_logs",
+            "filter": {},
+            "sort": {"date": -1},
+            "skip": 0,
+            "limit": 20,
+        }
+
+    elif endpoint == "employee_monthly":
+        command = {
+            "aggregate": "attendance_logs",
+            "pipeline": [
+                {"$match": {"emp_code": "TEST001"}}
+            ],
+            "cursor": {},
+        }
+
+    elif endpoint == "department_summary":
+        command = {
+            "aggregate": "employees",
+            "pipeline": [
+                {
+                    "$group": {
+                        "_id": "$department",
+                        "headcount": {"$sum": 1},
+                    }
+                }
+            ],
+            "cursor": {},
+        }
+
+    elif endpoint == "late_leaderboard":
+        command = {
+            "aggregate": "attendance_logs",
+            "pipeline": [
+                {"$match": {"late_minutes": {"$gt": 0}}},
+                {
+                    "$group": {
+                        "_id": "$emp_code",
+                        "total_late_minutes": {"$sum": "$late_minutes"},
+                    }
+                },
+                {
+                    "$sort": {
+                        "total_late_minutes": -1,
+                        "_id": 1,
+                    }
+                },
+            ],
+            "cursor": {},
+        }
+
+    elif endpoint == "department_trend":
+        command = {
+            "aggregate": "attendance_logs",
+            "pipeline": [
+                {
+                    "$match": {
+                        "date": {
+                            "$gte": "2026-10-01",
+                            "$lte": "2026-10-31",
+                        }
+                    }
+                },
+                {
+                    "$group": {
+                        "_id": "$date",
+                        "record_count": {"$sum": 1},
+                    }
+                },
+            ],
+            "cursor": {},
+        }
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="Unknown endpoint. Use attendance_list, employee_monthly, department_summary, late_leaderboard, or department_trend.",
+        )
+
+    try:
+        result = db.command(
+            "explain",
+            command,
+            verbosity="executionStats",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Unable to explain query: {str(exc)}",
+        )
+
+    execution_stats = result.get("executionStats", {})
+    query_planner = result.get("queryPlanner", {})
+
+    if endpoint in ("late_leaderboard", "department_trend"):
+        for stage in result.get("stages", []):
+            cursor_stage = stage.get("$cursor")
+            if cursor_stage:
+                execution_stats = cursor_stage.get("executionStats", {})
+                query_planner = cursor_stage.get("queryPlanner", {})
+                break
+
+    response = {
+        "endpoint": endpoint,
+        "executionStats": execution_stats,
+        "queryPlanner": query_planner,
+    }
+
+    if endpoint == "department_trend":
+        response["explainResult"] = result
+
+    return json.loads(json_util.dumps(response))

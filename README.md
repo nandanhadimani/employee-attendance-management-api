@@ -21,11 +21,42 @@ MongoDB Atlas or a local MongoDB instance can be used.
 
 ## Setup
 
-Create and activate a virtual environment, then install dependencies.
+### 1. Create and Activate a Virtual Environment
 
 Windows PowerShell:
 
 ```powershell
 python -m venv .venv
 .venv\Scripts\Activate.ps1
+```
+
+### 2. Install Dependencies
+
+```powershell
 pip install -r requirements.txt
+```
+
+### 3. Environment Configuration
+
+Create a `.env` file in the project root directory with the following variables:
+
+```env
+MONGO_URI=your_mongodb_connection_string
+MONGO_DB=attendance_db
+```
+
+Replace the placeholder with your MongoDB connection string.
+
+**Security:** Keep your database credentials private. Do not commit `.env` to GitHub.
+
+### 4. Run the Application
+
+```powershell
+python -m uvicorn app.main:app --port 8000
+```
+
+### 5. Open Swagger UI
+
+Open the following URL in your browser:
+
+http://127.0.0.1:8000/docs
