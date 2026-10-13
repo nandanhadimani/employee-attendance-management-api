@@ -20,6 +20,7 @@ from pymongo import MongoClient
 from decimal import Decimal, ROUND_HALF_UP
 from fastapi import HTTPException
 from bson import json_util
+from pymongo.errors import DuplicateKeyError
 
 load_dotenv()
 
@@ -44,15 +45,17 @@ app = FastAPI(title="Employee Attendance & Analytics API", version="2.0.0")
 # Helpers
 # --------------------------------------------------------------------------- #
 def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
-    # Convert punch-in time to IST
-    if punch_in.tzinfo is not None:
-        punch_in = punch_in.astimezone(IST)
-    else:
-        punch_in = punch_in.replace(tzinfo=IST)
+    # MongoDB may return naive datetimes representing UTC.
+    if punch_in.tzinfo is None:
+        punch_in = punch_in.replace(tzinfo=timezone.utc)
 
-    # Parse the shift start time
+    # Convert punch-in time to IST.
+    punch_in = punch_in.astimezone(IST)
+
+    # Parse the shift start time.
     hour, minute = map(int, shift_start.split(":"))
 
+    # Create the shift start datetime in IST.
     shift_start_dt = punch_in.replace(
         hour=hour,
         minute=minute,
@@ -60,14 +63,14 @@ def compute_late_minutes(punch_in: datetime, shift_start: str) -> int:
         microsecond=0,
     )
 
-    # Calculate elapsed seconds from shift start
+    # Calculate elapsed seconds from shift start.
     elapsed_seconds = (punch_in - shift_start_dt).total_seconds()
 
-    # Early arrivals and arrivals within 10 minutes are not late
+    # Early arrivals and arrivals within 10 minutes are not late.
     if elapsed_seconds <= 600:
         return 0
 
-    # Return whole elapsed minutes after shift start
+    # Return whole elapsed minutes after shift start.
     return int(elapsed_seconds // 60)
 
 def compute_work_hours(punch_in: datetime, punch_out: datetime) -> float:
@@ -153,6 +156,12 @@ class PunchInIn(BaseModel):
 class PunchOutIn(BaseModel):
     emp_code: str
     punched_at: Optional[int] = None
+class AttendanceRegularizationIn(BaseModel):
+    reason: str
+    regularized_by: str
+    status: Optional[str] = None
+    punch_in: Optional[int] = None
+    punch_out: Optional[int] = None
 
 
 # --------------------------------------------------------------------------- #
@@ -192,16 +201,51 @@ def list_employees(
 @app.post("/attendance/punch-in", status_code=201)
 def punch_in(body: PunchInIn):
     emp = db.employees.find_one({"emp_code": body.emp_code})
+
     if not emp:
-        raise HTTPException(status_code=404, detail="Employee not found")
+        raise HTTPException(
+            status_code=404,
+            detail="Employee not found"
+        )
+
     ts = (
-    datetime.fromtimestamp(body.punched_at / 1000, tz=timezone.utc)
-    if body.punched_at is not None
-    else datetime.now(timezone.utc)
-).replace(microsecond=0)
-    d = ts.astimezone(IST).date().isoformat()
-    if db.attendance_logs.find_one({"emp_code": body.emp_code, "date": d}):
-        raise HTTPException(409, "already punched in for this date")
+        datetime.fromtimestamp(
+            body.punched_at / 1000,
+            tz=timezone.utc
+        )
+        if body.punched_at is not None
+        else datetime.now(timezone.utc)
+    ).replace(microsecond=0)
+
+    local_ts = ts.astimezone(IST)
+
+    shift_start = datetime.strptime(
+        emp["shift_start"], "%H:%M"
+    ).time()
+
+    shift_end = datetime.strptime(
+        emp["shift_end"], "%H:%M"
+    ).time()
+
+    attendance_date = local_ts.date()
+
+    # Assign early-morning punches to the previous day
+    # for overnight shifts.
+    if shift_start > shift_end and local_ts.time() < shift_end:
+        attendance_date = attendance_date - timedelta(days=1)
+
+    # Always calculate the attendance date before using it.
+    d = attendance_date.isoformat()
+
+    if db.attendance_logs.find_one({
+        "emp_code": body.emp_code,
+        "date": d
+    }):
+        raise HTTPException(
+            status_code=409,
+            detail="Already punched in for this date"
+        )
+
     doc = {
         "emp_code": body.emp_code,
         "date": d,
@@ -209,14 +253,25 @@ def punch_in(body: PunchInIn):
         "punch_in": ts,
         "punch_out": None,
         "work_hours": None,
-        "late_minutes": compute_late_minutes(ts, emp["shift_start"]),
+        "late_minutes": compute_late_minutes(
+            ts, emp["shift_start"]
+        ),
         "overtime_minutes": 0,
         "half_day": False,
         "history": [],
     }
-    res = db.attendance_logs.insert_one(doc)
+
+    try:
+        res = db.attendance_logs.insert_one(doc)
+    except DuplicateKeyError:
+        raise HTTPException(
+            status_code=409,
+            detail="Already punched in for this date"
+        )
+
     doc["id"] = str(res.inserted_id)
     doc.pop("_id", None)
+
     return doc
 
 
@@ -393,81 +448,138 @@ def punch_out(body: PunchOutIn):
 def update_attendance(
     emp_code: str,
     date: str,
-    status: Optional[str] = None,
-    punch_in: Optional[int] = None,
-    punch_out: Optional[int] = None,
+    body: AttendanceRegularizationIn,
 ):
+    from datetime import datetime, timezone
+    from decimal import Decimal, ROUND_HALF_UP
+
     # Validate attendance status
     allowed_statuses = {
         "PRESENT", "WFH", "ON_DUTY", "ABSENT", "LEAVE"
     }
 
-    if status is not None and status not in allowed_statuses:
+    if body.status is not None and body.status not in allowed_statuses:
+        raise HTTPException(status_code=400, detail="Invalid status")
+
+    # Validate the date format
+    try:
+        datetime.strptime(date, "%Y-%m-%d")
+    except ValueError:
         raise HTTPException(
             status_code=400,
-            detail="Invalid status"
+            detail="Invalid date format. Use YYYY-MM-DD",
         )
 
-    # Find the attendance record
+    # Find the employee
+    employee = db.employees.find_one({"emp_code": emp_code})
+    if not employee:
+        raise HTTPException(status_code=404, detail="Employee not found")
+
+    # Find the exact attendance record
     record = db.attendance_logs.find_one({
         "emp_code": emp_code,
-        "date": date
+        "date": date,
     })
-
     if not record:
-        existing = db.attendance_logs.find_one(
-            {
-                "emp_code": emp_code,
-                "punch_in": {"$exists": True, "$ne": None},
-                "punch_out": {"$ne": None}
-            },
-            sort=[("punch_in", -1)]
-        )
-
-        if existing:
-            raise HTTPException(
-                status_code=409,
-                detail="Attendance record was already punched out"
-            )
-
         raise HTTPException(
             status_code=404,
-            detail="Punch-in record not found"
+            detail="Attendance record not found",
         )
 
-    # Prepare the fields to update
+    # Build the proposed updates
     updates = {}
 
-    if status is not None:
-        updates["status"] = status
+    if body.status is not None:
+        updates["status"] = body.status
 
-    if punch_in is not None:
-        updates["punch_in"] = datetime.fromtimestamp(
-            punch_in / 1000,
-            tz=timezone.utc
-        ).replace(microsecond=0)
+    for field in ("punch_in", "punch_out"):
+        timestamp_ms = getattr(body, field)
 
-    if punch_out is not None:
-        updates["punch_out"] = datetime.fromtimestamp(
-            punch_out / 1000,
-            tz=timezone.utc
-        ).replace(microsecond=0)
+        if timestamp_ms is not None:
+            updates[field] = datetime.fromtimestamp(
+                timestamp_ms / 1000,
+                tz=timezone.utc,
+            ).replace(microsecond=0)
 
     if not updates:
         raise HTTPException(
             status_code=400,
-            detail="No fields provided to update"
+            detail="No attendance fields provided to update",
         )
 
-    db.attendance_logs.update_one(
+    # Capture the previous values for the audit history
+    changes = {
+        field: {
+            "old": record.get(field),
+            "new": value,
+        }
+        for field, value in updates.items()
+    }
+
+    # Recalculate derived fields using the proposed timestamps
+    new_punch_in = updates.get("punch_in", record.get("punch_in"))
+    new_punch_out = updates.get("punch_out", record.get("punch_out"))
+
+    if new_punch_in is not None and new_punch_out is not None:
+        if new_punch_in.tzinfo is None:
+            new_punch_in = new_punch_in.replace(tzinfo=timezone.utc)
+
+        if new_punch_out.tzinfo is None:
+            new_punch_out = new_punch_out.replace(tzinfo=timezone.utc)
+
+        if new_punch_out <= new_punch_in:
+            raise HTTPException(
+                status_code=422,
+                detail="Punch-out time must be after punch-in time",
+            )
+
+        if new_punch_out > new_punch_in + timedelta(hours=24):
+            raise HTTPException(
+                status_code=422,
+                detail="Punch-out cannot be more than 24 hours after punch-in",
+            )
+
+        work_hours = compute_work_hours(new_punch_in, new_punch_out)
+        updates["work_hours"] = work_hours
+        updates["half_day"] = work_hours < 4.50
+
+        overtime = compute_overtime(
+            new_punch_out,
+            employee["shift_start"],
+            employee["shift_end"],
+            date,
+        )
+        updates["overtime_minutes"] = overtime
+
+    if new_punch_in is not None:
+        updates["late_minutes"] = compute_late_minutes(
+            new_punch_in,
+            employee["shift_start"],
+        )
+
+    # Store regularization history
+    history_entry = {
+        "reason": body.reason,
+        "regularized_by": body.regularized_by,
+        "regularized_at": datetime.now(timezone.utc),
+        "changes": changes,
+    }
+
+    result = db.attendance_logs.update_one(
         {"_id": record["_id"]},
-        {"$set": updates}
+        {
+            "$set": updates,
+            "$push": {"history": history_entry},
+        },
     )
 
-    updated = db.attendance_logs.find_one({
-        "_id": record["_id"]
-    })
+    if result.matched_count == 0:
+        raise HTTPException(
+            status_code=404,
+            detail="Attendance record not found",
+        )
 
+    updated = db.attendance_logs.find_one({"_id": record["_id"]})
     updated["id"] = str(updated.pop("_id"))
 
     return updated
